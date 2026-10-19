@@ -17,7 +17,7 @@ The same book code runs two ways:
 - [x] Correct matching engine with unit, randomized and differential tests
 - [x] ITCH 5.0 parser and per-symbol replay: a full trading day replays with zero invalid references
 - [x] Benchmark harness: throughput and p50/p90/p99/p99.9/max latency
-- [ ] Optimization rounds: at least three book implementations compared
+- [x] Optimization rounds: four book implementations compared (Apple M3 numbers; Linux run pending)
 - [ ] Strategy simulator (stretch)
 
 ## Architecture
@@ -140,12 +140,47 @@ Method:
 
 Plot a latency CSV with `python analysis/plot_latency.py results/<run>/latency.csv`.
 
-| Implementation | Workload | Mops/s | p50 | p99 | p99.9 | CPU |
-|---|---|---|---|---|---|---|
-| `MapOrderBook` (baseline) | itch-replay | _TBD_ | | | | |
+### Optimization rounds
 
-_Numbers are pending a run on a quiet Linux machine. On Apple Silicon `steady_clock` ticks every
-~42 ns, which is too coarse for per-operation latency._
+Each step is one change on top of the previous one
+([pooled_order_book.hpp](include/lob/pooled_order_book.hpp)). All four books pass the same unit,
+randomized and differential tests. All four replay the full July 30, 2019 day with identical
+results: 7,717,995 executions, 0 invalid references.
+
+ITCH replay: the book updates from the first 20M messages of the day (18.6M add / execute /
+cancel / delete / replace operations), pre-decoded and held in memory:
+
+| Book | Change | Mops/s | p50 ns | p90 ns | p99 ns | p99.9 ns |
+|---|---|---:|---:|---:|---:|---:|
+| `MapOrderBook` | baseline: `std::map` levels, `std::list` FIFO, `std::unordered_map` index | 5.27 | 125 | 423 | 959 | 1,631 |
+| `PoolOrderBook` | orders in one pool with a free list; intrusive FIFO links | 6.67 | 85 | 375 | 927 | 1,599 |
+| `PoolFlatOrderBook` | open-addressing hash index | 11.82 | 42 | 211 | 639 | 1,183 |
+| `VectorOrderBook` | sorted-vector price levels, best price at the back | **17.17** | 42 | 125 | **375** | **751** |
+
+Matching engine: 2M synthetic limit / market / cancel orders against a book of up to 10,000 resting
+orders. Throughput went from 15.66 to 35.98 Mops/s, and p99 from 295 to 85 ns.
+
+_Measured on an Apple M3 (clang 17, 3 runs plus a warm-up). Apple Silicon's `steady_clock` ticks
+every ~42 ns, so p50 values are quantized; publishable numbers will come from a pinned Linux x86
+run. Raw output: `results/m5-mac/` (not committed)._
+
+**Why each step helped:**
+
+- **Pooled orders and an intrusive FIFO** (+27%). Adding an order no longer allocates a
+  `std::list` node, and deleting one no longer frees it. The day has 125M adds and 120M deletes.
+  The gain is modest because the id index still allocates a node per entry.
+- **Flat hash index** (+77%, the biggest step). Every execute, cancel, delete and replace
+  starts with an id lookup. `std::unordered_map` loads the bucket array and then chases a
+  pointer to a separately allocated node, often two cache misses. Linear probing in one flat
+  array usually touches a single cache line, and inserts don't allocate. Fibonacci hashing
+  spreads ITCH's near-sequential ids. Backward-shift deletion means no tombstones, so probe
+  chains don't degrade over a 280M-message day.
+- **Sorted-vector levels** (+45%). Activity clusters near the top of the book. With the best
+  price at the back of a contiguous array, the best level is `back()`. Creating or removing a
+  level near the top shifts only a few entries. Finding a price is a binary search over adjacent
+  memory instead of a walk through red-black tree nodes scattered across the heap.
+
+Net: 3.3x throughput on real market data, and p99 down from 959 to 375 ns.
 
 ## Testing
 
@@ -176,6 +211,8 @@ analysis/            latency plotting
 ```
 
 ## Adding a book implementation
+
+`lob_replay --book map|pool|pool-flat|vector` replays a file with any implementation.
 
 1. Write a class that satisfies `lob::OrderBook`, e.g. `include/lob/pool_order_book.hpp`, and
    `static_assert(OrderBook<PoolOrderBook>)`.

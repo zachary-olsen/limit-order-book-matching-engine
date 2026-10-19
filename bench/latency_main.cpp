@@ -2,6 +2,9 @@
 //
 //   lob_latency [--itch FILE] [--messages N] [--ops N] [--runs R] [--csv PATH]
 //
+// Every book workload runs once per book implementation (map, pool,
+// pool-flat, vector), all on the same inputs in the same process.
+//
 // Workloads:
 //   matching          synthetic limit/market/cancel flow through the matching engine
 //   replay-synthetic  synthetic ITCH-style book updates (always available)
@@ -27,8 +30,9 @@
 #include "lob/itch/file.hpp"
 #include "lob/latency_histogram.hpp"
 #include "lob/matching_engine.hpp"
+#include "lob/pooled_order_book.hpp"
 #include "lob/replay.hpp"
-#include "synthetic_itch.hpp"
+#include "lob/synthetic_book_ops.hpp"
 #include "system_info.hpp"
 
 namespace {
@@ -140,6 +144,28 @@ struct OpCollector : itch::NullHandler {
   void on_order_replace(const itch::OrderReplace& m) { out->push_back(to_op(m)); }
 };
 
+struct Inputs {
+  std::vector<FlowOp> flow;
+  std::vector<BookOp> synthetic;
+  std::vector<BookOp> itch;  // empty without --itch
+};
+
+template <class Book>
+void measure_book(const char* book, const Inputs& in, int runs, std::vector<Result>& results) {
+  struct EngineState {
+    MatchingEngine<Book> engine;
+    EventBuffer out;
+  };
+  const std::string suffix = std::string("/") + book;
+  results.push_back(measure<EngineState>("matching" + suffix, in.flow, runs, [](EngineState& s, const FlowOp& op) {
+    s.out.clear();
+    apply_op(s.engine, op, s.out);
+  }));
+  auto apply = [](BookSet<Book>& b, const BookOp& op) { b.apply(op); };
+  results.push_back(measure<BookSet<Book>>("replay-synthetic" + suffix, in.synthetic, runs, apply));
+  if (!in.itch.empty()) results.push_back(measure<BookSet<Book>>("itch-replay" + suffix, in.itch, runs, apply));
+}
+
 Result measure_parse(const std::vector<std::uint8_t>& bytes, std::uint64_t messages, int runs,
                      std::vector<BookOp>& decoded) {
   std::vector<double> rates;
@@ -155,7 +181,7 @@ Result measure_parse(const std::vector<std::uint8_t>& bytes, std::uint64_t messa
 }
 
 void print_row(const Result& r) {
-  std::printf("%-18s %12llu %10.2f", r.name.c_str(), static_cast<unsigned long long>(r.ops), r.mops);
+  std::printf("%-26s %12llu %10.2f", r.name.c_str(), static_cast<unsigned long long>(r.ops), r.mops);
   if (r.hist) {
     const LatencyHistogram& h = *r.hist;
     std::printf(" %8llu %8llu %8llu %8llu %10llu\n", static_cast<unsigned long long>(h.percentile(0.50)),
@@ -187,44 +213,30 @@ int main(int argc, char** argv) {
   std::vector<Result> results;
 
   try {
-    {
-      FlowGenerator gen(1, benchmark_flow());
-      std::vector<FlowOp> flow(opt.ops);
-      for (auto& op : flow) op = gen.next();
-      struct EngineState {
-        MatchingEngine<> engine;
-        EventBuffer out;
-      };
-      results.push_back(measure<EngineState>("matching", flow, opt.runs, [](EngineState& s, const FlowOp& op) {
-        s.out.clear();
-        apply_op(s.engine, op, s.out);
-      }));
-    }
-    {
-      const auto ops = bench::synthetic_book_ops(opt.ops);
-      results.push_back(measure<BookSet<>>("replay-synthetic", ops, opt.runs,
-                                           [](BookSet<>& b, const BookOp& op) { b.apply(op); }));
-    }
+    Inputs in;
+    FlowGenerator gen(1, benchmark_flow());
+    in.flow.resize(opt.ops);
+    for (auto& op : in.flow) op = gen.next();
+    in.synthetic = synthetic_book_ops(opt.ops);
     if (!opt.itch_path.empty()) {
+      std::fprintf(stderr, "loading up to %llu messages from %s...\n", static_cast<unsigned long long>(opt.messages),
+                   opt.itch_path.c_str());
       std::uint64_t loaded = 0;
-      std::vector<BookOp> decoded;
-      {
-        std::fprintf(stderr, "loading up to %llu messages from %s...\n",
-                     static_cast<unsigned long long>(opt.messages), opt.itch_path.c_str());
-        itch::GzReader reader(opt.itch_path);
-        const auto bytes = itch::load_messages(reader, opt.messages, loaded);
-        results.push_back(measure_parse(bytes, loaded, opt.runs, decoded));
-      }
+      itch::GzReader reader(opt.itch_path);
+      const auto bytes = itch::load_messages(reader, opt.messages, loaded);
+      results.push_back(measure_parse(bytes, loaded, opt.runs, in.itch));
       BookSet<> check;
       std::uint64_t invalid = 0;
-      for (const BookOp& op : decoded) invalid += check.apply(op) ? 0 : 1;
+      for (const BookOp& op : in.itch) invalid += check.apply(op) ? 0 : 1;
       if (invalid != 0) {
         std::fprintf(stderr, "warning: %llu invalid references in the loaded slice\n",
                      static_cast<unsigned long long>(invalid));
       }
-      results.push_back(measure<BookSet<>>("itch-replay", decoded, opt.runs,
-                                           [](BookSet<>& b, const BookOp& op) { b.apply(op); }));
     }
+    measure_book<MapOrderBook>("map", in, opt.runs, results);
+    measure_book<PoolOrderBook>("pool", in, opt.runs, results);
+    measure_book<PoolFlatOrderBook>("pool-flat", in, opt.runs, results);
+    measure_book<VectorOrderBook>("vector", in, opt.runs, results);
   } catch (const std::exception& e) {
     std::fprintf(stderr, "error: %s\n", e.what());
     return 1;
@@ -240,7 +252,7 @@ int main(int argc, char** argv) {
 #ifndef NDEBUG
   std::printf("WARNING:  assertions are enabled; this is not a Release build, numbers are not meaningful\n");
 #endif
-  std::printf("\n%-18s %12s %10s %8s %8s %8s %8s %10s\n", "workload", "ops", "Mops/s", "p50 ns", "p90 ns", "p99 ns",
+  std::printf("\n%-26s %12s %10s %8s %8s %8s %8s %10s\n", "workload", "ops", "Mops/s", "p50 ns", "p90 ns", "p99 ns",
               "p99.9 ns", "max ns");
   for (const Result& r : results) print_row(r);
 

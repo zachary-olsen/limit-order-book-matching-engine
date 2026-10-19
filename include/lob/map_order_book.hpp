@@ -21,12 +21,7 @@ namespace lob {
 // Every later implementation is checked against this one.
 class MapOrderBook {
  public:
-  struct LevelInfo {
-    Price price;
-    std::uint64_t total;
-    std::size_t orders;
-    friend bool operator==(const LevelInfo&, const LevelInfo&) = default;
-  };
+  using LevelInfo = lob::LevelInfo;
 
   bool add(OrderId id, Side side, Price price, Qty qty);
   bool reduce(OrderId id, Qty qty);

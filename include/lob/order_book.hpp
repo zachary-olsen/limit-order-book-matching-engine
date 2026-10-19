@@ -2,6 +2,7 @@
 
 #include <concepts>
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 
 #include "lob/types.hpp"
@@ -22,6 +23,9 @@ namespace lob {
 //   find(id)                   the resting order, or nullptr
 //   front(side)                oldest order at the best price, or nullptr
 //   best_price(side)           best price on that side, if any
+//
+// Pointers returned by find() and front() are valid until the next call that
+// modifies the book.
 template <class B>
 concept OrderBook = requires(B& b, const B& cb, OrderId id, Side side, Price price, Qty qty) {
   { b.add(id, side, price, qty) } -> std::same_as<bool>;
@@ -32,6 +36,14 @@ concept OrderBook = requires(B& b, const B& cb, OrderId id, Side side, Price pri
   { cb.front(side) } -> std::same_as<const Order*>;
   { cb.best_price(side) } -> std::same_as<std::optional<Price>>;
   { cb.order_count() } -> std::convertible_to<std::size_t>;
+};
+
+// Aggregate view of one price level, for snapshots and tests.
+struct LevelInfo {
+  Price price;
+  std::uint64_t total;
+  std::size_t orders;
+  friend bool operator==(const LevelInfo&, const LevelInfo&) = default;
 };
 
 // Crossed or locked: the best bid is at or above the best ask.

@@ -4,7 +4,7 @@
 // while its stock is trading (halted or paused stocks may legitimately cross).
 //
 //   lob_replay FILE [--symbol AAPL] [--interval SECONDS] [--max-messages N] [--depth N]
-//              [--crossings-csv PATH]
+//              [--crossings-csv PATH] [--book map|pool|pool-flat|vector]
 
 #include <algorithm>
 #include <chrono>
@@ -19,11 +19,11 @@
 #include <vector>
 
 #include "lob/itch/file.hpp"
+#include "lob/pooled_order_book.hpp"
 #include "lob/replay.hpp"
 
 namespace {
 
-using lob::MapOrderBook;
 using lob::Price;
 using lob::Side;
 
@@ -36,15 +36,17 @@ struct Options {
   std::uint64_t max_messages = UINT64_MAX;
   std::size_t depth = 5;
   std::string crossings_csv;
+  std::string book = "map";
 };
 
 [[noreturn]] void usage(const char* argv0) {
   std::fprintf(stderr,
                "usage: %s FILE [--symbol TICKER] [--interval SECONDS] [--max-messages N] [--depth N]\n"
-               "          [--crossings-csv PATH]\n"
+               "          [--crossings-csv PATH] [--book map|pool|pool-flat|vector]\n"
                "  FILE may be gzip-compressed or raw ITCH 5.0.\n"
                "  --symbol prints a top-of-book snapshot for TICKER every interval (default 60s).\n"
-               "  --crossings-csv writes every locked/crossed book seen during market hours.\n",
+               "  --crossings-csv writes every locked/crossed book seen during market hours.\n"
+               "  --book picks the order book implementation (default map).\n",
                argv0);
   std::exit(2);
 }
@@ -62,6 +64,7 @@ Options parse_args(int argc, char** argv) {
     else if (arg == "--max-messages") o.max_messages = std::stoull(value());
     else if (arg == "--depth") o.depth = std::stoul(value());
     else if (arg == "--crossings-csv") o.crossings_csv = value();
+    else if (arg == "--book") o.book = value();
     else if (arg == "-h" || arg == "--help") usage(argv[0]);
     else if (o.path.empty() && arg[0] != '-') o.path = arg;
     else usage(argv[0]);
@@ -85,7 +88,10 @@ std::string dollars(Price p) {
   return buf;
 }
 
-class ReplayTool : public lob::Replayer<> {
+template <class Book>
+class ReplayTool : public lob::Replayer<Book> {
+  using Base = lob::Replayer<Book>;
+
  public:
   explicit ReplayTool(const Options& o) : opt_(o), next_snapshot_(o.interval_ns) {}
 
@@ -96,18 +102,18 @@ class ReplayTool : public lob::Replayer<> {
         next_snapshot_ += opt_.interval_ns;
       }
     }
-    Replayer::before_message(h);
+    Base::before_message(h);
   }
 
-  [[nodiscard]] bool stopped() const { return stats().messages >= opt_.max_messages; }
+  [[nodiscard]] bool stopped() const { return this->stats().messages >= opt_.max_messages; }
 
-  [[nodiscard]] const MapOrderBook* tracked_book() {
-    if (!locate_) locate_ = locate_of(opt_.symbol);
-    return locate_ ? books().find(*locate_) : nullptr;
+  [[nodiscard]] const Book* tracked_book() {
+    if (!locate_) locate_ = this->locate_of(opt_.symbol);
+    return locate_ ? this->books().find(*locate_) : nullptr;
   }
 
   void print_depth() {
-    const MapOrderBook* book = tracked_book();
+    const Book* book = tracked_book();
     if (book == nullptr) {
       std::printf("\n%s: no orders seen\n", opt_.symbol.c_str());
       return;
@@ -127,7 +133,7 @@ class ReplayTool : public lob::Replayer<> {
 
  private:
   void snapshot(std::uint64_t at) {
-    const MapOrderBook* book = tracked_book();
+    const Book* book = tracked_book();
     if (book == nullptr || book->order_count() == 0) return;
     const auto bid = book->levels(Side::Buy, 1);
     const auto ask = book->levels(Side::Sell, 1);
@@ -139,7 +145,7 @@ class ReplayTool : public lob::Replayer<> {
                                   static_cast<unsigned long long>(ask[0].total));
     else std::printf("  ask %-21s", "-");
     if (!bid.empty() && !ask.empty()) std::printf("  spread %s", dollars(ask[0].price - bid[0].price).c_str());
-    std::printf("  orders %zu%s\n", book->order_count(), market_open() ? "" : "  (closed)");
+    std::printf("  orders %zu%s\n", book->order_count(), this->market_open() ? "" : "  (closed)");
   }
 
   Options opt_;
@@ -158,7 +164,8 @@ const char* state_name(char s) {
 }
 
 // Summarises locked/crossed books by trading state and by symbol.
-void report_crossings(const ReplayTool& tool, const Options& opt) {
+template <class Tool>
+void report_crossings(const Tool& tool, const Options& opt) {
   const auto& crossings = tool.crossings();
   if (crossings.empty()) return;
 
@@ -205,11 +212,9 @@ void report_crossings(const ReplayTool& tool, const Options& opt) {
   }
 }
 
-}  // namespace
-
-int main(int argc, char** argv) {
-  const Options opt = parse_args(argc, argv);
-  ReplayTool tool(opt);
+template <class Book>
+int run(const Options& opt) {
+  ReplayTool<Book> tool(opt);
 
   const auto start = std::chrono::steady_clock::now();
   std::uint64_t bytes = 0;
@@ -244,4 +249,14 @@ int main(int argc, char** argv) {
   report_crossings(tool, opt);
   if (!opt.symbol.empty()) tool.print_depth();
   return s.invalid_refs == 0 && s.malformed == 0 && s.crossed_while_trading == 0 ? 0 : 3;
+}
+}  // namespace
+
+int main(int argc, char** argv) {
+  const Options opt = parse_args(argc, argv);
+  if (opt.book == "map") return run<lob::MapOrderBook>(opt);
+  if (opt.book == "pool") return run<lob::PoolOrderBook>(opt);
+  if (opt.book == "pool-flat") return run<lob::PoolFlatOrderBook>(opt);
+  if (opt.book == "vector") return run<lob::VectorOrderBook>(opt);
+  usage(argv[0]);
 }

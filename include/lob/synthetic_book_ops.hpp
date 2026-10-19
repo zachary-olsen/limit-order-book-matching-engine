@@ -7,7 +7,7 @@
 #include "lob/itch/encoder.hpp"
 #include "lob/replay.hpp"
 
-namespace lob::bench {
+namespace lob {
 
 // A self-consistent stream of book ops for one symbol (every reference is to
 // a live order with enough shares), for benchmarking without an ITCH file.
@@ -73,7 +73,7 @@ inline std::vector<BookOp> synthetic_book_ops(std::size_t n, std::uint64_t seed 
 }
 
 // Encodes book ops as ITCH messages, for parser benchmarks.
-inline std::vector<std::uint8_t> encode(const std::vector<BookOp>& ops) {
+inline std::vector<std::uint8_t> encode_itch(const std::vector<BookOp>& ops) {
   itch::Encoder enc;
   std::uint64_t ts = 34'200'000'000'000ULL;
   for (const BookOp& op : ops) {
@@ -90,4 +90,4 @@ inline std::vector<std::uint8_t> encode(const std::vector<BookOp>& ops) {
   return enc.bytes();
 }
 
-}  // namespace lob::bench
+}  // namespace lob

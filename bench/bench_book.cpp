@@ -11,8 +11,9 @@
 #include "lob/itch/parser.hpp"
 #include "lob/map_order_book.hpp"
 #include "lob/matching_engine.hpp"
+#include "lob/pooled_order_book.hpp"
 #include "lob/replay.hpp"
-#include "synthetic_itch.hpp"
+#include "lob/synthetic_book_ops.hpp"
 
 namespace {
 
@@ -70,7 +71,7 @@ void BM_AddThenCancel(benchmark::State& state) {
 // Replay-style book updates (ITCH add/execute/cancel/delete/replace), no parsing.
 template <class Book>
 void BM_ReplayApply(benchmark::State& state) {
-  const auto ops = bench::synthetic_book_ops(static_cast<std::size_t>(state.range(0)));
+  const auto ops = synthetic_book_ops(static_cast<std::size_t>(state.range(0)));
   std::optional<BookSet<Book>> books;
   for (auto _ : state) {
     state.PauseTiming();
@@ -85,7 +86,7 @@ void BM_ReplayApply(benchmark::State& state) {
 
 // ITCH decoding only: a handler that touches each decoded field cheaply.
 void BM_ItchParse(benchmark::State& state) {
-  const auto bytes = bench::encode(bench::synthetic_book_ops(static_cast<std::size_t>(state.range(0))));
+  const auto bytes = encode_itch(synthetic_book_ops(static_cast<std::size_t>(state.range(0))));
   struct Sink : itch::NullHandler {
     std::uint64_t acc = 0;
     void on_add_order(const itch::AddOrder& m) { acc += m.ref + m.price; }
@@ -103,9 +104,15 @@ void BM_ItchParse(benchmark::State& state) {
   state.SetBytesProcessed(state.iterations() * static_cast<std::int64_t>(bytes.size()));
 }
 
-BENCHMARK_TEMPLATE(BM_MatchingFlow, MapOrderBook)->Arg(100'000)->Unit(benchmark::kMillisecond);
-BENCHMARK_TEMPLATE(BM_AddThenCancel, MapOrderBook)->Arg(10'000)->Arg(100'000)->Unit(benchmark::kMillisecond);
-BENCHMARK_TEMPLATE(BM_ReplayApply, MapOrderBook)->Arg(1'000'000)->Unit(benchmark::kMillisecond);
+#define LOB_BOOK_BENCHMARKS(Book)                                                                    \
+  BENCHMARK_TEMPLATE(BM_MatchingFlow, Book)->Arg(100'000)->Unit(benchmark::kMillisecond);            \
+  BENCHMARK_TEMPLATE(BM_AddThenCancel, Book)->Arg(10'000)->Arg(100'000)->Unit(benchmark::kMillisecond); \
+  BENCHMARK_TEMPLATE(BM_ReplayApply, Book)->Arg(1'000'000)->Unit(benchmark::kMillisecond)
+
+LOB_BOOK_BENCHMARKS(MapOrderBook);
+LOB_BOOK_BENCHMARKS(PoolOrderBook);
+LOB_BOOK_BENCHMARKS(PoolFlatOrderBook);
+LOB_BOOK_BENCHMARKS(VectorOrderBook);
 BENCHMARK(BM_ItchParse)->Arg(1'000'000)->Unit(benchmark::kMillisecond);
 
 }  // namespace
