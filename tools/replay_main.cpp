@@ -1,15 +1,22 @@
 // Replays a NASDAQ TotalView-ITCH 5.0 file, rebuilding every symbol's book,
-// and reports message statistics and validation results.
+// and reports message statistics and validation results. Exits non-zero on
+// any invalid reference, malformed message, or book that locks or crosses
+// while its stock is trading (halted or paused stocks may legitimately cross).
 //
 //   lob_replay FILE [--symbol AAPL] [--interval SECONDS] [--max-messages N] [--depth N]
+//              [--crossings-csv PATH]
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <fstream>
+#include <map>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "lob/itch/file.hpp"
 #include "lob/replay.hpp"
@@ -28,13 +35,16 @@ struct Options {
   std::uint64_t interval_ns = 60 * kNsPerSec;
   std::uint64_t max_messages = UINT64_MAX;
   std::size_t depth = 5;
+  std::string crossings_csv;
 };
 
 [[noreturn]] void usage(const char* argv0) {
   std::fprintf(stderr,
                "usage: %s FILE [--symbol TICKER] [--interval SECONDS] [--max-messages N] [--depth N]\n"
+               "          [--crossings-csv PATH]\n"
                "  FILE may be gzip-compressed or raw ITCH 5.0.\n"
-               "  --symbol prints a top-of-book snapshot for TICKER every interval (default 60s).\n",
+               "  --symbol prints a top-of-book snapshot for TICKER every interval (default 60s).\n"
+               "  --crossings-csv writes every locked/crossed book seen during market hours.\n",
                argv0);
   std::exit(2);
 }
@@ -51,6 +61,7 @@ Options parse_args(int argc, char** argv) {
     else if (arg == "--interval") o.interval_ns = std::stoull(value()) * kNsPerSec;
     else if (arg == "--max-messages") o.max_messages = std::stoull(value());
     else if (arg == "--depth") o.depth = std::stoul(value());
+    else if (arg == "--crossings-csv") o.crossings_csv = value();
     else if (arg == "-h" || arg == "--help") usage(argv[0]);
     else if (o.path.empty() && arg[0] != '-') o.path = arg;
     else usage(argv[0]);
@@ -105,6 +116,7 @@ class ReplayTool : public lob::Replayer<> {
                 "bid", "shares", "ask", "shares");
     const auto bids = book->levels(Side::Buy, opt_.depth);
     const auto asks = book->levels(Side::Sell, opt_.depth);
+    if (bids.empty() && asks.empty()) std::printf("%14s\n", "(book empty)");
     for (std::size_t i = 0; i < std::max(bids.size(), asks.size()); ++i) {
       const std::string b = i < bids.size() ? dollars(bids[i].price) : "";
       const std::string a = i < asks.size() ? dollars(asks[i].price) : "";
@@ -134,6 +146,64 @@ class ReplayTool : public lob::Replayer<> {
   std::uint64_t next_snapshot_;
   std::optional<std::uint16_t> locate_;
 };
+
+const char* state_name(char s) {
+  switch (s) {
+    case 'T': return "trading";
+    case 'H': return "halted";
+    case 'P': return "paused";
+    case 'Q': return "quotation only";
+    default: return "unknown";
+  }
+}
+
+// Summarises locked/crossed books by trading state and by symbol.
+void report_crossings(const ReplayTool& tool, const Options& opt) {
+  const auto& crossings = tool.crossings();
+  if (crossings.empty()) return;
+
+  std::map<char, std::uint64_t> by_state;
+  struct PerSymbol {
+    std::uint64_t count = 0, first = 0, last = 0;
+    std::uint64_t locked = 0;  // bid == ask
+    char state = '?';
+  };
+  std::map<std::uint16_t, PerSymbol> by_symbol;
+  for (const lob::Crossing& c : crossings) {
+    ++by_state[c.trading_state];
+    PerSymbol& s = by_symbol[c.locate];
+    if (s.count++ == 0) s.first = c.timestamp;
+    s.last = c.timestamp;
+    s.locked += c.bid == c.ask ? 1 : 0;
+    s.state = c.trading_state;
+  }
+
+  std::printf("\nLocked/crossed books in market hours by trading state:\n");
+  for (const auto& [state, n] : by_state) {
+    std::printf("  %-15s %8llu\n", state_name(state), static_cast<unsigned long long>(n));
+  }
+
+  std::vector<std::pair<std::uint16_t, PerSymbol>> top(by_symbol.begin(), by_symbol.end());
+  std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second.count > b.second.count; });
+  std::printf("\n%zu symbols affected; top 15:\n  %-8s %7s %7s  %-8s  %-8s  %s\n", top.size(), "symbol", "events",
+              "locked", "first", "last", "state at last event");
+  for (std::size_t i = 0; i < std::min<std::size_t>(15, top.size()); ++i) {
+    const auto& [locate, s] = top[i];
+    std::printf("  %-8s %7llu %7llu  %-8s  %-8s  %s\n", tool.symbol_of(locate).c_str(),
+                static_cast<unsigned long long>(s.count), static_cast<unsigned long long>(s.locked),
+                clock_time(s.first).c_str(), clock_time(s.last).c_str(), state_name(s.state));
+  }
+
+  if (!opt.crossings_csv.empty()) {
+    std::ofstream f(opt.crossings_csv);
+    f << "timestamp_ns,time,symbol,trading_state,bid,ask\n";
+    for (const lob::Crossing& c : crossings) {
+      f << c.timestamp << ',' << clock_time(c.timestamp) << ',' << tool.symbol_of(c.locate) << ','
+        << c.trading_state << ',' << dollars(c.bid) << ',' << dollars(c.ask) << '\n';
+    }
+    std::printf("\nwrote %zu crossings to %s\n", crossings.size(), opt.crossings_csv.c_str());
+  }
+}
 
 }  // namespace
 
@@ -166,9 +236,12 @@ int main(int argc, char** argv) {
   std::printf("Executions (E+C):            %llu (%llu shares)\n", static_cast<unsigned long long>(s.executions),
               static_cast<unsigned long long>(s.executed_shares));
   std::printf("Invalid references:          %llu\n", static_cast<unsigned long long>(s.invalid_refs));
-  std::printf("Crossed/locked in mkt hours: %llu\n", static_cast<unsigned long long>(s.crossed_in_market_hours));
+  std::printf("Crossed/locked in mkt hours: %llu (while trading: %llu; the rest while halted or paused)\n",
+              static_cast<unsigned long long>(s.crossed_in_market_hours),
+              static_cast<unsigned long long>(s.crossed_while_trading));
   std::printf("Malformed messages:          %llu\n", static_cast<unsigned long long>(s.malformed));
 
+  report_crossings(tool, opt);
   if (!opt.symbol.empty()) tool.print_depth();
-  return s.invalid_refs == 0 && s.malformed == 0 ? 0 : 3;
+  return s.invalid_refs == 0 && s.malformed == 0 && s.crossed_while_trading == 0 ? 0 : 3;
 }

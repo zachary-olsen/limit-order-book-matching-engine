@@ -34,6 +34,13 @@ struct StockDirectory {  // 'R'
   Symbol stock;
 };
 
+struct StockTradingAction {  // 'H'
+  Header h;
+  Symbol stock;
+  char trading_state;  // H halted, P paused, Q quotation only, T trading
+  std::array<char, 4> reason;
+};
+
 struct AddOrder {  // 'A', and 'F' (with MPID attribution, which we ignore)
   Header h;
   OrderId ref;
@@ -93,6 +100,7 @@ constexpr std::size_t decoded_length(char type) noexcept {
   switch (type) {
     case 'S': return 12;
     case 'R': return 39;
+    case 'H': return 25;
     case 'A': return 36;
     case 'F': return 40;
     case 'E': return 31;

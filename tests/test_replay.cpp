@@ -118,19 +118,38 @@ TEST_F(ReplayTest, TracksCrossedBooksOnlyDuringMarketHours) {
   enc_.add_order(kAapl, 15, 4, Side::Sell, 100, "AAPL", 1'000'000);
   run();
   EXPECT_EQ(replay_.stats().crossed_in_market_hours, 1u);
+  EXPECT_EQ(replay_.stats().crossed_while_trading, 1u) << "no 'H' seen: treated as trading";
+  ASSERT_EQ(replay_.crossings().size(), 1u);
+  EXPECT_EQ(replay_.crossings()[0].timestamp, 13u);
+  EXPECT_EQ(replay_.crossings()[0].bid, 1'000'100);
+  EXPECT_EQ(replay_.crossings()[0].ask, 1'000'000);
   EXPECT_FALSE(replay_.market_open());
+}
+
+TEST_F(ReplayTest, RecordsTradingStateOfCrossings) {
+  enc_.system_event(0, 9, 'Q');
+  enc_.stock_trading_action(kAapl, 10, "AAPL", 'H');
+  enc_.add_order(kAapl, 11, 1, Side::Buy, 100, "AAPL", 1'000'100);
+  enc_.add_order(kAapl, 12, 2, Side::Sell, 100, "AAPL", 1'000'000);
+  enc_.stock_trading_action(kAapl, 13, "AAPL", 'T');
+  run();
+  EXPECT_EQ(replay_.trading_state(kAapl), 'T');
+  EXPECT_EQ(replay_.trading_state(kMsft), '?');
+  ASSERT_EQ(replay_.crossings().size(), 1u);
+  EXPECT_EQ(replay_.crossings()[0].trading_state, 'H');
+  EXPECT_EQ(replay_.stats().crossed_while_trading, 0u);
 }
 
 TEST_F(ReplayTest, CountsMessagesByType) {
   enc_.add_order(kAapl, 10, 1, Side::Buy, 100, "AAPL", 1'000'000);
-  enc_.raw('H', kAapl, 11, 25);
+  enc_.raw('Y', kAapl, 11, 20);
   enc_.trade(kAapl, 12, 0, Side::Buy, 10, "AAPL", 1'000'000, 5);
   run();
   const ReplayStats& s = replay_.stats();
   EXPECT_EQ(s.messages, 5u);
   EXPECT_EQ(s.by_type['R'], 2u);
   EXPECT_EQ(s.by_type['A'], 1u);
-  EXPECT_EQ(s.by_type['H'], 1u);
+  EXPECT_EQ(s.by_type['Y'], 1u);
   EXPECT_EQ(s.by_type['P'], 1u);
   EXPECT_EQ(s.book_ops, 1u);
   EXPECT_EQ(replay_.last_timestamp(), 12u);

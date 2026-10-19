@@ -25,6 +25,7 @@ struct Recorder : NullHandler {
   std::vector<OrderDelete> deletes;
   std::vector<OrderReplace> replaces;
   std::vector<Trade> trades;
+  std::vector<StockTradingAction> actions;
   int other = 0;
   int malformed = 0;
 
@@ -41,6 +42,7 @@ struct Recorder : NullHandler {
   void on_order_delete(const OrderDelete& m) { deletes.push_back(m); }
   void on_order_replace(const OrderReplace& m) { replaces.push_back(m); }
   void on_trade(const Trade& m) { trades.push_back(m); }
+  void on_stock_trading_action(const StockTradingAction& m) { actions.push_back(m); }
   void on_other(const Header&) { ++other; }
   void on_malformed(char, std::size_t) { ++malformed; }
 };
@@ -67,11 +69,12 @@ TEST(ItchParser, DecodesEveryBookMessage) {
   enc.order_delete(7, kTs + 5, 2);
   enc.order_replace(7, kTs + 6, 0x1122334455667788ULL, 3, 80, 1'234'400);
   enc.trade(7, kTs + 7, 0, Side::Sell, 5, "AAPL", 1'234'500, 1001);
+  enc.stock_trading_action(7, kTs + 8, "AAPL", 'H', "LUDP");
 
   Recorder r;
   const auto& bytes = enc.bytes();
   ASSERT_EQ(parse_buffer(bytes.data(), bytes.size(), r), bytes.size());
-  EXPECT_EQ(std::string(r.types.begin(), r.types.end()), "SRAFECXDUP");
+  EXPECT_EQ(std::string(r.types.begin(), r.types.end()), "SRAFECXDUPH");
   EXPECT_EQ(r.malformed, 0);
 
   EXPECT_EQ(r.headers[0].timestamp, kTs);
@@ -100,11 +103,14 @@ TEST(ItchParser, DecodesEveryBookMessage) {
   EXPECT_EQ(r.replaces.at(0).shares, 80u);
   EXPECT_EQ(r.replaces.at(0).price, 1'234'400u);
   EXPECT_EQ(r.trades.at(0).match, 1001u);
+  EXPECT_EQ(to_string(r.actions.at(0).stock), "AAPL");
+  EXPECT_EQ(r.actions.at(0).trading_state, 'H');
+  EXPECT_EQ(std::string(r.actions.at(0).reason.data(), 4), "LUDP");
 }
 
 TEST(ItchParser, SkipsUndecodedTypesAndFlagsBadLengths) {
   Encoder enc;
-  enc.raw('H', 1, kTs, 25);   // trading action: valid, not decoded
+  enc.raw('Y', 1, kTs, 20);   // Reg SHO restriction: valid, not decoded
   enc.raw('I', 1, kTs, 50);   // NOII
   enc.raw('A', 1, kTs, 30);   // add order with the wrong length
   enc.raw('Z', 1, kTs, 5);    // shorter than a header

@@ -15,7 +15,7 @@ The same book code runs two ways:
 
 - [x] Build, tests, sanitizers, CI
 - [x] Correct matching engine with unit, randomized and differential tests
-- [x] ITCH 5.0 parser and per-symbol replay with validation (tested on synthetic data; full-day run pending)
+- [x] ITCH 5.0 parser and per-symbol replay: a full trading day replays with zero invalid references
 - [x] Benchmark harness: throughput and p50/p90/p99/p99.9/max latency
 - [ ] Optimization rounds: at least three book implementations compared
 - [ ] Strategy simulator (stretch)
@@ -72,7 +72,9 @@ Each level also keeps a running total quantity, and an empty level is erased imm
 - Stock locate codes index a vector of books directly, so ticker strings are never hashed.
 - Every E, C, X and D must reference a live order with enough shares, and every violation is counted.
 - `U` (replace) deletes the old id and adds a new id on the same side. The new order goes to the back of the queue.
-- Adds and replaces that leave a book locked or crossed during market hours (between `S` events `Q` and `M`) are counted.
+- Adds and replaces that leave a book locked or crossed during market hours (between `S` events `Q` and `M`) are
+  logged with the stock's trading state from its latest `H` message. A halted or paused stock may legitimately
+  cross, because Nasdaq stops matching until the reopening auction. A stock that is trading must never cross.
 
 ## Build and test
 
@@ -97,8 +99,30 @@ which is git-ignored, since the files are large and not ours to redistribute.
 ```
 
 The tool prints a top-of-book snapshot every interval, then message counts by type,
-executions, invalid references, crossed-book count, and final depth. It exits non-zero
-if any reference was invalid or any message was malformed.
+executions, invalid references, crossed books by trading state, and final depth. It exits
+non-zero on any invalid reference, any malformed message, or any book that crosses while
+its stock is trading. Add `--crossings-csv PATH` to dump every crossing.
+
+### Validation: July 30, 2019
+
+| | |
+|---|---|
+| Messages replayed | 282,229,684 (8.66 GB uncompressed) |
+| Symbols | 8,849 |
+| Orders added (`A` + `F`) | 125,460,750 |
+| Executions against the book (`E` + `C`) | 7,717,995 (921,453,624 shares) |
+| Invalid references (E/C/X/D/U on a missing order or too few shares) | **0** |
+| Malformed messages | **0** |
+| Books locked or crossed while the stock was trading | **0** |
+| Books locked or crossed while halted or paused | 485, in 4 symbols (ARRY, SES, CCIH, BIQI) |
+
+Sanity checks on AAPL:
+
+- **Spread:** $0.01–0.02 through regular hours, wider before the open and after the close.
+- **Close:** the quote at 16:00 was $208.85 / $208.89, matching the official close of about $208.8.
+- **After hours:** the book moves to about $217. Apple reported earnings after the close that day.
+
+All remaining orders are deleted after the post-market session, so every book is empty at the end of the file.
 
 ## Benchmarks
 

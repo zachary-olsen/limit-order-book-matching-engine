@@ -95,7 +95,17 @@ struct ReplayStats {
   std::uint64_t executions = 0;
   std::uint64_t executed_shares = 0;
   std::uint64_t crossed_in_market_hours = 0;  // add/replace left the book locked or crossed
+  std::uint64_t crossed_while_trading = 0;    // ...while the stock was not halted or paused: must be zero
   std::uint64_t malformed = 0;
+};
+
+// One add/replace during market hours that left a book locked or crossed.
+struct Crossing {
+  std::uint64_t timestamp;
+  std::uint16_t locate;
+  char trading_state;  // the stock's state from its latest 'H' message
+  Price bid;
+  Price ask;
 };
 
 // ITCH handler that rebuilds every symbol's book and validates each reference.
@@ -112,6 +122,7 @@ class Replayer : public itch::NullHandler {
     if (m.event_code == 'Q') market_open_ = true;
     if (m.event_code == 'M') market_open_ = false;
   }
+  void on_stock_trading_action(const itch::StockTradingAction& m) { trading_state_[m.h.locate] = m.trading_state; }
   void on_stock_directory(const itch::StockDirectory& m) {
     std::string name = itch::to_string(m.stock);
     locates_[name] = m.h.locate;
@@ -130,6 +141,8 @@ class Replayer : public itch::NullHandler {
   [[nodiscard]] bool market_open() const noexcept { return market_open_; }
   [[nodiscard]] std::uint64_t last_timestamp() const noexcept { return last_timestamp_; }
   [[nodiscard]] std::size_t symbol_count() const noexcept { return symbols_.size(); }
+  [[nodiscard]] const std::vector<Crossing>& crossings() const noexcept { return crossings_; }
+  [[nodiscard]] char trading_state(std::uint16_t locate) const noexcept { return trading_state_[locate]; }
 
   [[nodiscard]] std::optional<std::uint16_t> locate_of(const std::string& symbol) const {
     auto it = locates_.find(symbol);
@@ -152,13 +165,28 @@ class Replayer : public itch::NullHandler {
     ++stats_.book_ops;
     if (!books_.apply(op)) {
       ++stats_.invalid_refs;
-    } else if (may_cross && market_open_ && is_crossed(books_.book(op.locate))) {
-      ++stats_.crossed_in_market_hours;
+    } else if (may_cross && market_open_) {
+      const Book& book = books_.book(op.locate);
+      if (is_crossed(book)) {
+        ++stats_.crossed_in_market_hours;
+        // '?' (no 'H' seen yet) counts as trading, the conservative choice.
+        const char state = trading_state_[op.locate];
+        if (state == 'T' || state == '?') ++stats_.crossed_while_trading;
+        if (crossings_.size() < kMaxCrossingsLogged) {
+          crossings_.push_back({last_timestamp_, op.locate, trading_state_[op.locate], *book.best_price(Side::Buy),
+                                *book.best_price(Side::Sell)});
+        }
+      }
     }
   }
 
+  static constexpr std::size_t kMaxCrossingsLogged = 1'000'000;
+
   BookSet<Book> books_;
   ReplayStats stats_;
+  std::vector<Crossing> crossings_;
+  std::vector<char> trading_state_ = std::vector<char>(65536, '?');  // '?' until the first 'H'
+
   std::unordered_map<std::uint16_t, std::string> symbols_;
   std::unordered_map<std::string, std::uint16_t> locates_;
   std::uint64_t last_timestamp_ = 0;

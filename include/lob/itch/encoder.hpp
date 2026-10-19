@@ -34,6 +34,15 @@ class Encoder {
     put8('N');      // inverse
   }
 
+  void stock_trading_action(std::uint16_t locate, std::uint64_t ts, std::string_view stock, char state,
+                            std::string_view reason = "    ") {
+    begin('H', locate, ts, 25);
+    put_symbol(stock);
+    put8(static_cast<std::uint8_t>(state));
+    put8(' ');  // reserved
+    for (std::size_t i = 0; i < 4; ++i) put8(i < reason.size() ? static_cast<std::uint8_t>(reason[i]) : ' ');
+  }
+
   void add_order(std::uint16_t locate, std::uint64_t ts, OrderId ref, Side side, Qty shares,
                  std::string_view stock, std::uint32_t price) {
     begin('A', locate, ts, 36);

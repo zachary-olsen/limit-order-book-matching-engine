@@ -49,6 +49,7 @@ inline Side side(std::uint8_t c) noexcept { return c == 'B' ? Side::Buy : Side::
 struct NullHandler {
   void on_system_event(const SystemEvent&) {}
   void on_stock_directory(const StockDirectory&) {}
+  void on_stock_trading_action(const StockTradingAction&) {}
   void on_add_order(const AddOrder&) {}
   void on_order_executed(const OrderExecuted&) {}
   void on_order_executed_with_price(const OrderExecutedWithPrice&) {}
@@ -81,6 +82,12 @@ bool parse_message(const std::uint8_t* p, std::size_t len, Handler& h) {
   switch (type) {
     case 'S': h.on_system_event(SystemEvent{hd, static_cast<char>(p[11])}); break;
     case 'R': h.on_stock_directory(StockDirectory{hd, symbol(p + 11)}); break;
+    case 'H': {
+      std::array<char, 4> reason;
+      std::memcpy(reason.data(), p + 21, reason.size());
+      h.on_stock_trading_action(StockTradingAction{hd, symbol(p + 11), static_cast<char>(p[19]), reason});
+      break;
+    }
     case 'A':
     case 'F':
       h.on_add_order(AddOrder{hd, be64(p + 11), side(p[19]), be32(p + 20), symbol(p + 24), be32(p + 32)});
