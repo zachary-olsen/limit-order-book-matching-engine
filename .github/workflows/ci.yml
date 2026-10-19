@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  sanitizers:
+    name: ASan + UBSan (${{ matrix.cxx }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cc: gcc-13
+            cxx: g++-13
+          - cc: clang-18
+            cxx: clang++-18
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y ninja-build zlib1g-dev
+      - name: Configure
+        run: cmake --preset debug -DCMAKE_C_COMPILER=${{ matrix.cc }} -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} -DLOB_WERROR=ON
+      - name: Build
+        run: cmake --build --preset debug
+      - name: Test
+        env:
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: ctest --preset debug -j4
+
+  release:
+    name: Release build + benchmark smoke test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y ninja-build zlib1g-dev
+      - name: Configure
+        run: cmake --preset release -DCMAKE_CXX_COMPILER=clang++-18 -DLOB_WERROR=ON
+      - name: Build
+        run: cmake --build --preset release
+      - name: Test
+        run: ctest --preset release -j4
+      # Shared CI runners are too noisy for performance gating; this only
+      # checks that the benchmarks run. Compare numbers on a quiet machine.
+      - name: Benchmarks
+        run: |
+          ./build/release/lob_latency --ops 500000 --runs 3
+          ./build/release/lob_bench --benchmark_min_time=0.05s
