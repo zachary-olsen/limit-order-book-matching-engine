@@ -33,6 +33,7 @@ class MapOrderBook {
   [[nodiscard]] std::optional<Price> best_price(Side side) const;
   [[nodiscard]] std::size_t order_count() const noexcept { return index_.size(); }
   [[nodiscard]] std::size_t level_count(Side side) const noexcept;
+  [[nodiscard]] std::uint64_t depth_at(Side side, Price price) const;  // total resting quantity at price
 
   // Best-first view of up to max_levels levels (for snapshots and tests).
   [[nodiscard]] std::vector<LevelInfo> levels(Side side, std::size_t max_levels = SIZE_MAX) const;

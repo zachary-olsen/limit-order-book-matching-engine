@@ -15,6 +15,7 @@
 // implementations with the same interface (Bids selects the ordering):
 //
 //   try_emplace(price)  {pointer to the slot, true} if inserted, {existing, false} if present
+//   find(price)         pointer to the slot, or nullptr
 //   erase(price)        remove a price that is present
 //   best()              slot of the best price (precondition: not empty)
 //   for_each(f)         f(price, slot) best-first until f returns false
@@ -27,6 +28,10 @@ class MapLevels {
   std::pair<std::uint32_t*, bool> try_emplace(Price price) {
     auto [it, inserted] = map_.try_emplace(price, 0);
     return {&it->second, inserted};
+  }
+  [[nodiscard]] const std::uint32_t* find(Price price) const {
+    auto it = map_.find(price);
+    return it == map_.end() ? nullptr : &it->second;
   }
   void erase(Price price) { map_.erase(price); }
   [[nodiscard]] std::uint32_t best() const { return map_.begin()->second; }
@@ -57,6 +62,10 @@ class VectorLevels {
     it = levels_.insert(it, {price, 0});
     return {&it->second, true};
   }
+  [[nodiscard]] const std::uint32_t* find(Price price) const {
+    auto it = position(levels_, price);
+    return it != levels_.end() && it->first == price ? &it->second : nullptr;
+  }
   void erase(Price price) {
     if (levels_.back().first == price) {
       levels_.pop_back();
@@ -80,10 +89,12 @@ class VectorLevels {
   static bool worse(Price a, Price b) noexcept { return Bids ? a < b : a > b; }
 
   // First entry not worse than price.
-  auto position(Price price) {
-    return std::lower_bound(levels_.begin(), levels_.end(), price,
+  template <class Vec>
+  static auto position(Vec& levels, Price price) {
+    return std::lower_bound(levels.begin(), levels.end(), price,
                             [](const std::pair<Price, std::uint32_t>& e, Price p) { return worse(e.first, p); });
   }
+  auto position(Price price) { return position(levels_, price); }
 
   std::vector<std::pair<Price, std::uint32_t>> levels_;
 };

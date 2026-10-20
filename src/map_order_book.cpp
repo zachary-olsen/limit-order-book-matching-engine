@@ -91,6 +91,13 @@ std::size_t MapOrderBook::level_count(Side side) const noexcept {
   return side == Side::Buy ? bids_.size() : asks_.size();
 }
 
+std::uint64_t MapOrderBook::depth_at(Side side, Price price) const {
+  return on_side(*this, side, [price](const auto& levels) -> std::uint64_t {
+    auto it = levels.find(price);
+    return it == levels.end() ? 0 : it->second.total;
+  });
+}
+
 std::vector<MapOrderBook::LevelInfo> MapOrderBook::levels(Side side, std::size_t max_levels) const {
   std::vector<LevelInfo> out;
   on_side(*this, side, [&](const auto& levels) {

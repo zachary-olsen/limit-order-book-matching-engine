@@ -34,6 +34,10 @@ TYPED_TEST(OrderBookTest, BestPricesAndLevelOrdering) {
   EXPECT_EQ(book.levels(Side::Buy),
             (std::vector<Level>{{102, 20, 1}, {101, 30, 1}, {100, 10, 1}}));
   EXPECT_EQ(book.levels(Side::Sell, 1), (std::vector<Level>{{103, 6, 1}}));
+  EXPECT_EQ(book.depth_at(Side::Buy, 101), 30u);
+  EXPECT_EQ(book.depth_at(Side::Sell, 105), 5u);
+  EXPECT_EQ(book.depth_at(Side::Sell, 104), 0u);
+  EXPECT_EQ(book.depth_at(Side::Buy, 103), 0u) << "price on the other side";
   EXPECT_EQ(book.validate(), "");
 }
 

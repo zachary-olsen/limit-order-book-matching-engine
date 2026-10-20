@@ -62,6 +62,9 @@ target_link_libraries(lob PUBLIC ZLIB::ZLIB PRIVATE lob_warnings)
 add_executable(lob_replay tools/replay_main.cpp)
 target_link_libraries(lob_replay PRIVATE lob lob_warnings)
 
+add_executable(lob_strategy tools/strategy_main.cpp)
+target_link_libraries(lob_strategy PRIVATE lob lob_warnings)
+
 include(FetchContent)
 set(FETCHCONTENT_QUIET ON)
 
@@ -80,6 +83,7 @@ if(LOB_BUILD_TESTS)
     tests/test_itch.cpp
     tests/test_replay.cpp
     tests/test_histogram.cpp
+    tests/test_strategy.cpp
   )
   target_include_directories(lob_tests PRIVATE tests)
   target_link_libraries(lob_tests PRIVATE lob lob_warnings GTest::gtest_main)

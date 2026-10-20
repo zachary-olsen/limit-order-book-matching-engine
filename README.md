@@ -18,7 +18,7 @@ The same book code runs two ways:
 - [x] ITCH 5.0 parser and per-symbol replay: a full trading day replays with zero invalid references
 - [x] Benchmark harness: throughput and p50/p90/p99/p99.9/max latency
 - [x] Optimization rounds: four book implementations compared (Apple M3 numbers; Linux run pending)
-- [ ] Strategy simulator (stretch)
+- [x] Strategy simulator: market making against the replayed day with exact queue-position fills
 
 ## Architecture
 
@@ -182,6 +182,57 @@ run. Raw output: `results/m5-mac/` (not committed)._
 
 Net: 3.3x throughput on real market data, and p99 down from 959 to 375 ns.
 
+## Strategy simulation
+
+`lob_strategy` runs a simple market maker against one symbol of a replayed day
+([strategy.hpp](include/lob/strategy.hpp)):
+
+```sh
+./build/release/lob_strategy data/07302019.NASDAQ_ITCH50.gz --symbol AAPL
+python analysis/plot_strategy.py results/strategy-AAPL -o strategy.png
+```
+
+**Strategy.** Quote 100 shares one tick inside the spread, or join the best price when the
+spread is under three ticks. Shift both quotes one tick against inventory per 200 shares held,
+and stop quoting a side at ±1,000 shares. Quote only during regular hours, and only while the
+stock is trading (not halted).
+
+**Fill simulation.** Historical flow can't react to our orders, so they are tracked as shadow
+orders beside the real book. Because ITCH is order-by-order data, queue position is **exact**,
+not estimated. When a quote goes live, every order resting at its price is ahead of it, and
+every later order is behind it. A quote fills when:
+
+1. an order **behind** it at the same price executes (FIFO means we would have traded first),
+2. an order at a **worse** price on our side executes (price priority), or
+3. an opposite-side order arrives at a price that **reaches** our quote.
+
+Executions, cancels, deletes and replaces of orders ahead of us move us up the queue. A replaced
+order re-enters behind us. New quotes go live after a 20 µs entry latency, so one aggressive order
+that prints as several executions can't fill us twice.
+
+**AAPL, July 30, 2019, 9:30–16:00:**
+
+| | |
+|---|---|
+| Quotes sent | 78,970 |
+| Fill rate | 12.9% of quotes received a fill |
+| Shares traded | 822,156 (13,059 fills) |
+| Max \|inventory\| | 480 shares |
+| Spread captured at fill | +0.51 ¢/share vs. mid |
+| Mid move in the 1 s after a fill | −0.87 ¢/share |
+| P&L marked to the closing mid | −$3,305 (−0.40 ¢/share) |
+
+![AAPL strategy simulation](docs/strategy-aapl-20190730.png)
+
+The strategy earns about half of AAPL's one-cent spread on every fill, then loses more than that
+to **adverse selection**: the mid moves against it by 0.87¢ within a second. The orders that fill a
+passive quote are disproportionately the informed ones. This is why real market makers depend on
+exchange rebates, faster cancellation, and short-horizon price signals.
+
+**Not modelled:** fees and rebates, market impact (our fills don't change the real flow), and
+cancel latency (cancels are instant). This is a simulation exercise, not evidence of a profitable
+(or unprofitable) strategy.
+
 ## Testing
 
 - **Unit tests** cover each matching rule: resting, full and partial fills, multi-level sweeps,
@@ -206,7 +257,8 @@ include/lob/itch/    ITCH 5.0 messages, parser, gzip streaming, encoder (tests a
 src/                 non-template implementations
 tests/               GoogleTest unit, randomized and differential tests
 bench/               Google Benchmark microbenchmarks, latency harness, run script
-tools/               lob_replay CLI
+tools/               lob_replay and lob_strategy CLIs
+docs/                charts referenced by this README
 analysis/            latency plotting
 ```
 

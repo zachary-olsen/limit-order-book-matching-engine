@@ -120,6 +120,13 @@ class PooledOrderBook {
     return side == Side::Buy ? bids_.size() : asks_.size();
   }
 
+  [[nodiscard]] std::uint64_t depth_at(Side side, Price price) const {
+    return on_side(side, [&](const auto& levels) -> std::uint64_t {
+      const std::uint32_t* l = levels.find(price);
+      return l == nullptr ? 0 : levels_[*l].total;
+    });
+  }
+
   [[nodiscard]] std::vector<LevelInfo> levels(Side side, std::size_t max_levels = SIZE_MAX) const {
     std::vector<LevelInfo> out;
     on_side(side, [&](const auto& levels) {
