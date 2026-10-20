@@ -207,30 +207,61 @@ every later order is behind it. A quote fills when:
 3. an opposite-side order arrives at a price that **reaches** our quote.
 
 Executions, cancels, deletes and replaces of orders ahead of us move us up the queue. A replaced
-order re-enters behind us. New quotes go live after a 20 µs entry latency, so one aggressive order
-that prints as several executions can't fill us twice.
+order re-enters behind us.
 
-**AAPL, July 30, 2019, 9:30–16:00:**
+**Latency applies both ways.** A new quote is live only once it reaches the exchange, 20 µs
+after it is sent by default. A quote we decide to pull **can still be filled** until our cancel
+arrives, 20 µs later. So a side can briefly have two quotes at the exchange: the one being cancelled
+and its replacement. Entry latency also stops one aggressive order that prints as several
+executions from filling a refilled quote twice.
+
+**AAPL, July 30, 2019, 9:30–16:00 (20 µs latency):**
 
 | | |
 |---|---|
-| Quotes sent | 78,970 |
-| Fill rate | 12.9% of quotes received a fill |
-| Shares traded | 822,156 (13,059 fills) |
-| Max \|inventory\| | 480 shares |
-| Spread captured at fill | +0.51 ¢/share vs. mid |
-| Mid move in the 1 s after a fill | −0.87 ¢/share |
-| P&L marked to the closing mid | −$3,305 (−0.40 ¢/share) |
+| Quotes sent | 79,565 |
+| Fill rate | 14.4% of quotes received a fill |
+| Shares traded | 942,601 (15,114 fills) |
+| Fills on quotes already pulled | 5.1% |
+| Max \|inventory\| | 726 shares |
+| Spread captured at fill | +0.48 ¢/share vs. mid |
+| Mid move in the 1 s after a fill | −0.86 ¢/share |
+| P&L marked to the closing mid | −$3,878 (−0.41 ¢/share) |
 
 ![AAPL strategy simulation](docs/strategy-aapl-20190730.png)
 
 The strategy earns about half of AAPL's one-cent spread on every fill, then loses more than that
-to **adverse selection**: the mid moves against it by 0.87¢ within a second. The orders that fill a
+to **adverse selection**: the mid moves against it by 0.86¢ within a second. The orders that fill a
 passive quote are disproportionately the informed ones. This is why real market makers depend on
-exchange rebates, faster cancellation, and short-horizon price signals.
+exchange rebates, speed, and short-horizon price signals.
+
+### How latency changes the result
+
+The same strategy and day, run at every latency from an idealized 0 to a slow 100 ms
+(`analysis/latency_sweep.sh`, plotted with `analysis/plot_latency_sweep.py`):
+
+| Latency | Fills on pulled quotes | Spread captured | Mid move after fill | P&L per share | P&L |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 0% | +0.50¢ | −0.87¢ | −0.41¢ | −$3,845 |
+| 1 µs | 3.5% | +0.49¢ | −0.85¢ | −0.39¢ | −$3,681 |
+| 20 µs | 5.1% | +0.48¢ | −0.86¢ | −0.41¢ | −$3,878 |
+| 100 µs | 19.2% | +0.37¢ | −0.84¢ | −0.49¢ | −$4,621 |
+| 1 ms | 36.2% | +0.24¢ | −0.81¢ | −0.61¢ | −$6,623 |
+| 10 ms | 43.8% | +0.18¢ | −0.80¢ | −0.64¢ | −$6,900 |
+| 100 ms | 51.7% | +0.10¢ | −0.81¢ | −0.70¢ | −$7,249 |
+
+![Latency sweep](docs/latency-sweep-aapl-20190730.png)
+
+A slow market maker sees the price move and pulls its quote, but its cancel is still in flight when
+faster traders hit the stale price. At 100 ms over half its fills come that way. Those fills happen
+**after** the price has already moved, so the damage shows up as the spread captured collapsing
+(+0.50¢ to +0.10¢), not as a larger move afterwards. The loss per share grows by 70%. Below about
+20 µs the curve is flat: on this data, a few microseconds rarely decides whether a cancel lands in
+time. In real markets that range is fought over by firms racing each other, and this simulation
+has no competitors.
 
 **Not modelled:** fees and rebates, market impact (our fills don't change the real flow), and
-cancel latency (cancels are instant). This is a simulation exercise, not evidence of a profitable
+other traders reacting to our quotes. This is a simulation exercise, not evidence of a profitable
 (or unprofitable) strategy.
 
 ## Testing

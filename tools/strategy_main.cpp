@@ -42,7 +42,7 @@ struct Options {
                "  --size           shares per quote (default 100)\n"
                "  --max-inventory  stop quoting a side past this many shares (default 1000)\n"
                "  --skew           shift quotes one tick per N shares of inventory (default 200)\n"
-               "  --latency-us     delay before a new quote is live (default 20)\n"
+               "  --latency-us     order entry and cancel latency to the exchange (default 20)\n"
                "  --out            directory for fills.csv and pnl.csv (default results/strategy-TICKER)\n",
                argv0);
   std::exit(2);
@@ -60,7 +60,7 @@ Options parse_args(int argc, char** argv) {
     else if (arg == "--size") o.policy.size = static_cast<lob::Qty>(std::stoul(value()));
     else if (arg == "--max-inventory") o.policy.max_inventory = std::stoll(value());
     else if (arg == "--skew") o.policy.skew_shares_per_tick = std::stoll(value());
-    else if (arg == "--latency-us") o.params.entry_latency_ns = std::stoull(value()) * 1'000;
+    else if (arg == "--latency-us") o.params.latency_ns = std::stoull(value()) * 1'000;
     else if (arg == "--out") o.out = value();
     else if (arg == "-h" || arg == "--help") usage(argv[0]);
     else if (o.path.empty() && arg[0] != '-') o.path = arg;
@@ -82,10 +82,10 @@ std::string clock_time(std::uint64_t ns) {
 void write_csvs(const Sim& sim, const std::string& dir) {
   std::filesystem::create_directories(dir);
   std::ofstream fills(dir + "/fills.csv");
-  fills << "timestamp_ns,time,side,price,qty,mid,mid_after\n";
+  fills << "timestamp_ns,time,side,price,qty,while_cancelling,mid,mid_after\n";
   for (const auto& f : sim.fills()) {
     fills << f.timestamp << ',' << clock_time(f.timestamp) << ',' << (f.side == Side::Buy ? "buy" : "sell") << ','
-          << static_cast<double>(f.price) / kPricePerDollar << ',' << f.qty << ',' << f.mid / kPricePerDollar << ','
+          << static_cast<double>(f.price) / kPricePerDollar << ',' << f.qty << ',' << f.while_cancelling << ',' << f.mid / kPricePerDollar << ','
           << f.mid_after / kPricePerDollar << '\n';
   }
   std::ofstream pnl(dir + "/pnl.csv");
@@ -116,9 +116,9 @@ void report(const Sim& sim, const Options& opt, double secs) {
 
   std::printf("Strategy: quote %u shares one tick inside the spread (join the best price when the spread is under\n"
               "          3 ticks), shift quotes 1 tick per %lld shares of inventory, |inventory| <= %lld,\n"
-              "          new quotes live after %.0f us\n",
+              "          %.0f us order entry and cancel latency\n",
               p.size, static_cast<long long>(p.skew_shares_per_tick), static_cast<long long>(p.max_inventory),
-              static_cast<double>(opt.params.entry_latency_ns) / 1'000.0);
+              static_cast<double>(opt.params.latency_ns) / 1'000.0);
   std::printf("Symbol:   %s, regular hours, %.1f s to replay\n\n", opt.symbol.c_str(), secs);
   std::printf("Quotes sent / cancelled:   %llu / %llu\n", static_cast<unsigned long long>(st.quotes_sent),
               static_cast<unsigned long long>(st.quotes_cancelled));
@@ -128,6 +128,9 @@ void report(const Sim& sim, const Options& opt, double secs) {
   std::printf("Fills:                     %llu (bought %llu, sold %llu shares)\n",
               static_cast<unsigned long long>(st.fills), static_cast<unsigned long long>(st.shares_bought),
               static_cast<unsigned long long>(st.shares_sold));
+  std::printf("Fills while cancelling:    %llu (%.1f%% of fills: quote pulled, cancel still in flight)\n",
+              static_cast<unsigned long long>(st.fills_while_cancelling),
+              st.fills ? 100.0 * static_cast<double>(st.fills_while_cancelling) / static_cast<double>(st.fills) : 0.0);
   std::printf("Max |inventory|:           %lld shares (final %lld)\n", static_cast<long long>(st.max_abs_inventory),
               static_cast<long long>(sim.inventory()));
   std::printf("P&L marked to mid:         $%.2f (%.2f cents per share traded)\n", sim.pnl() / kPricePerDollar,

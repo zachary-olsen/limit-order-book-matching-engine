@@ -46,7 +46,7 @@ class StrategySimTest : public ::testing::Test {
   }
   static SimParams no_latency() {
     SimParams p;
-    p.entry_latency_ns = 0;
+    p.latency_ns = 0;
     return p;
   }
 
@@ -122,10 +122,58 @@ TEST_F(StrategySimTest, EntryLatencyStopsRefillDuringOneSweep) {
   enc_.order_executed(kLoc, ts_, 1, 300, 1);
   enc_.order_executed(kLoc, ts_, 1, 300, 2);
   SimParams p;
-  p.entry_latency_ns = 1'000;
+  p.latency_ns = 1'000;
   Sim sim = run({kBid + 100, std::nullopt}, p);
   EXPECT_EQ(sim.stats().shares_bought, 100u) << "the refilled quote is not live until 1us later";
   EXPECT_EQ(sim.stats().quotes_sent, 2u);
+}
+
+TEST_F(StrategySimTest, PulledQuoteCanBeFilledUntilCancelArrives) {
+  add(1, Side::Buy, 1'000, kBid);
+  add(2, Side::Sell, 100, kAsk);  // ts 12: our $100.01 bid is sent, live at ts 1012
+  ts_ = 2'000;
+  add(3, Side::Buy, 100, kBid - 100);  // any message after 1012: the bid is now live
+  enc_.stock_trading_action(kLoc, 3'000, "TEST", 'H');  // halt: we pull the bid, cancel lands at 4000
+  enc_.order_executed(kLoc, 3'500, 1, 40, 1);  // a seller hits $100.00 before our cancel lands
+  enc_.order_executed(kLoc, 5'000, 1, 40, 2);  // after the cancel landed
+  SimParams p;
+  p.latency_ns = 1'000;
+  Sim sim = run({kBid + 100, std::nullopt}, p);
+  EXPECT_EQ(sim.stats().shares_bought, 40u);
+  EXPECT_EQ(sim.stats().fills_while_cancelling, 1u);
+  ASSERT_EQ(sim.fills().size(), 1u);
+  EXPECT_TRUE(sim.fills()[0].while_cancelling);
+  EXPECT_EQ(sim.quotes_outstanding(Side::Buy), 0u);
+}
+
+// Bids at the current best bid, so a new best bid means cancel-and-replace.
+struct FollowBestBid {
+  Quotes operator()(Price best_bid, Price, std::int64_t) const { return {best_bid, std::nullopt, 100}; }
+};
+
+TEST(StrategySimLatency, OldQuoteStaysLiveWhileReplacementIsInFlight) {
+  SimParams p;
+  p.latency_ns = 1'000;
+  StrategySim<VectorOrderBook, FollowBestBid> sim("TEST", FollowBestBid{}, p);
+  auto feed = [&sim](const Encoder& e) { itch::parse_buffer(e.bytes().data(), e.bytes().size(), sim); };
+
+  Encoder setup;
+  setup.stock_directory(kLoc, 0, "TEST");
+  setup.system_event(0, 1, 'Q');
+  setup.add_order(kLoc, 10, 1, Side::Buy, 500, "TEST", kBid);
+  setup.add_order(kLoc, 11, 2, Side::Sell, 500, "TEST", kAsk);  // quote A sent at kBid, live at 1011
+  setup.add_order(kLoc, 2'000, 3, Side::Buy, 100, "TEST", kBid + 100);  // A goes live; then cancel A, send B
+  feed(setup);
+  EXPECT_EQ(sim.quotes_outstanding(Side::Buy), 2u) << "A awaiting its cancel, B in flight";
+  EXPECT_FALSE(sim.live_quote(Side::Buy)) << "A is being cancelled and B is not live yet";
+
+  Encoder later;
+  later.add_order(kLoc, 3'500, 4, Side::Sell, 100, "TEST", kAsk + 100);  // both cancel and B have arrived
+  feed(later);
+  EXPECT_EQ(sim.quotes_outstanding(Side::Buy), 1u);
+  ASSERT_TRUE(sim.live_quote(Side::Buy));
+  EXPECT_EQ(sim.live_quote(Side::Buy)->price, kBid + 100);
+  EXPECT_EQ(sim.live_quote(Side::Buy)->ahead, 100u) << "B joined behind order 3";
 }
 
 TEST_F(StrategySimTest, RoundTripPnl) {

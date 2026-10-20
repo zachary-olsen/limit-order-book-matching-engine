@@ -1,10 +1,10 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
-#include <limits>
 #include <optional>
 #include <string>
 #include <utility>
@@ -29,9 +29,13 @@
 // Executions, cancels, deletes and replaces of orders ahead of the quote move
 // it up the queue.
 //
-// Assumptions: no market impact (the real flow is unchanged by our fills),
-// no fees or rebates, cancels take effect instantly, and new quotes become
-// live only after `entry_latency_ns`.
+// Latency applies both ways: a new quote is live `latency_ns` after it is
+// sent, and a cancelled quote can still be filled until `latency_ns` after
+// the cancel is sent. A side can therefore briefly have two quotes at the
+// exchange: the one being cancelled and its replacement.
+//
+// Assumptions: no market impact (the real flow is unchanged by our fills) and
+// no fees or rebates.
 namespace lob::sim {
 
 struct Quotes {
@@ -67,9 +71,9 @@ struct InsideSpreadPolicy {
 };
 
 struct SimParams {
-  std::uint64_t entry_latency_ns = 20'000;     // new quotes go live this long after they are sent
-  std::uint64_t markout_ns = 1'000'000'000;    // measure the mid this long after each fill
-  std::uint64_t sample_ns = 1'000'000'000;     // P&L / inventory sampling interval
+  std::uint64_t latency_ns = 20'000;        // order entry and cancel latency to the exchange
+  std::uint64_t markout_ns = 1'000'000'000;  // measure the mid this long after each fill
+  std::uint64_t sample_ns = 1'000'000'000;   // P&L / inventory sampling interval
 };
 
 struct Fill {
@@ -77,8 +81,9 @@ struct Fill {
   Side side;
   Price price;
   Qty qty;
-  double mid;        // mid price just before the message that filled us
-  double mid_after;  // mid price markout_ns later (NaN until known)
+  bool while_cancelling;  // the quote had already been cancelled; the cancel had not arrived
+  double mid;             // mid price just before the message that filled us
+  double mid_after;       // mid price markout_ns later (NaN until known)
 };
 
 struct PnlSample {
@@ -93,6 +98,7 @@ struct SimStats {
   std::uint64_t quotes_cancelled = 0;
   std::uint64_t quotes_filled = 0;  // quotes that received at least one fill
   std::uint64_t fills = 0;
+  std::uint64_t fills_while_cancelling = 0;
   std::uint64_t shares_bought = 0;
   std::uint64_t shares_sold = 0;
   std::int64_t max_abs_inventory = 0;
@@ -107,7 +113,13 @@ class StrategySim : public itch::NullHandler {
   StrategySim(std::string symbol, Policy policy, SimParams params = {})
       : symbol_(std::move(symbol)), policy_(std::move(policy)), params_(params) {}
 
-  void before_message(const itch::Header& h) { now_ = h.timestamp; }
+  void before_message(const itch::Header& h) {
+    now_ = h.timestamp;
+    if (mine(h)) {
+      advance(Side::Buy);
+      advance(Side::Sell);
+    }
+  }
 
   void on_system_event(const itch::SystemEvent& m) {
     if (m.event_code == 'Q') {
@@ -116,8 +128,11 @@ class StrategySim : public itch::NullHandler {
     } else if (m.event_code == 'M') {
       update();
       market_open_ = false;
-      place(Side::Buy, std::nullopt, 0);
-      place(Side::Sell, std::nullopt, 0);
+      for (auto& side : quotes_) {
+        stats_.quotes_cancelled += static_cast<std::uint64_t>(
+            std::count_if(side.begin(), side.end(), [](const Shadow& q) { return !q.dead_at; }));
+        side.clear();
+      }
       if (last_mid_) samples_.push_back({now_, *last_mid_, inventory_, pnl()});
     }
   }
@@ -179,32 +194,49 @@ class StrategySim : public itch::NullHandler {
   }
   [[nodiscard]] bool found_symbol() const noexcept { return locate_.has_value(); }
 
-  // Live quote on a side, if any: {price, remaining, quantity ahead in queue}.
+  // The live quote on a side that is not being cancelled, if any.
   struct QuoteView {
     Price price;
     Qty remaining;
     std::uint64_t ahead;
   };
   [[nodiscard]] std::optional<QuoteView> live_quote(Side side) const {
-    const Shadow& q = side == Side::Buy ? bid_ : ask_;
-    if (q.state != Shadow::State::Live) return std::nullopt;
-    return QuoteView{q.price, q.remaining, q.ahead};
+    for (const Shadow& q : quotes_[index(side)]) {
+      if (q.live && !q.dead_at) return QuoteView{q.price, q.remaining, q.ahead};
+    }
+    return std::nullopt;
   }
+  // Number of quotes at the exchange or in flight on a side (including ones being cancelled).
+  [[nodiscard]] std::size_t quotes_outstanding(Side side) const { return quotes_[index(side)].size(); }
 
  private:
   struct Shadow {
-    enum class State : std::uint8_t { Off, Pending, Live };
-    State state = State::Off;
     Price price = 0;
     Qty remaining = 0;
-    std::uint64_t ahead = 0;     // resting quantity ahead of us at our price
-    Seq seq_limit = 0;           // book orders with seq < seq_limit were there before us
-    std::uint64_t live_at = 0;   // when a pending quote becomes live
+    bool live = false;                   // false while the new order is in flight
+    std::uint64_t live_at = 0;           // when the new order reaches the exchange
+    std::optional<std::uint64_t> dead_at;  // when our cancel reaches the exchange
+    std::uint64_t ahead = 0;             // resting quantity ahead of us at our price
+    Seq seq_limit = 0;                   // book orders with seq < seq_limit were there before us
     bool filled = false;
   };
 
+  static std::size_t index(Side side) { return side == Side::Buy ? 0 : 1; }
   [[nodiscard]] bool mine(const itch::Header& h) const { return locate_ && h.locate == *locate_; }
-  Shadow& quote(Side side) { return side == Side::Buy ? bid_ : ask_; }
+
+  // Live quotes on a side in priority order: better price first, then earlier.
+  // Usually one or two; more only when quotes change faster than the latency.
+  template <class F>
+  void for_each_live(Side side, F&& f) {
+    auto& qs = quotes_[index(side)];
+    std::sort(qs.begin(), qs.end(), [side](const Shadow& a, const Shadow& b) {
+      if (a.price != b.price) return side == Side::Buy ? a.price > b.price : a.price < b.price;
+      return a.live_at < b.live_at;
+    });
+    for (Shadow& q : qs) {
+      if (q.live) f(q);
+    }
+  }
 
   void added(OrderId ref, Side side, Price price, Qty shares) {
     if (!book_.add(ref, side, price, shares)) {
@@ -212,9 +244,11 @@ class StrategySim : public itch::NullHandler {
       return;
     }
     seq_limit_ = book_.find(ref)->seq + 1;
-    // Rule 3: an order that reaches our quote would have traded with it.
-    const Shadow& contra = quote(opposite(side));
-    if (contra.state == Shadow::State::Live && crosses(side, price, contra.price)) fill(opposite(side), shares);
+    // Rule 3: an order that reaches our quotes would have traded with them.
+    Qty left = shares;
+    for_each_live(opposite(side), [&](Shadow& q) {
+      if (crosses(side, price, q.price)) left -= fill(opposite(side), q, left);
+    });
   }
 
   void executed(OrderId ref, Qty shares) {
@@ -226,14 +260,16 @@ class StrategySim : public itch::NullHandler {
     const Order before = *o;
     book_.reduce(ref, shares);
 
-    Shadow& q = quote(before.side);
-    if (q.state != Shadow::State::Live) return;
-    const bool worse_price = before.side == Side::Buy ? before.price < q.price : before.price > q.price;
-    if (before.price == q.price && before.seq < q.seq_limit) {
-      q.ahead -= std::min<std::uint64_t>(q.ahead, shares);  // ahead of us: we move up
-    } else if (before.price == q.price || worse_price) {
-      fill(before.side, shares);  // rules 1 and 2
-    }
+    Qty left = shares;
+    for_each_live(before.side, [&](Shadow& q) {
+      const bool worse_price = before.side == Side::Buy ? before.price < q.price : before.price > q.price;
+      if (before.price == q.price && before.seq < q.seq_limit) {
+        q.ahead -= std::min<std::uint64_t>(q.ahead, shares);  // ahead of us: we move up
+      } else if (before.price == q.price || worse_price) {
+        left -= fill(before.side, q, left);  // rules 1 and 2
+      }
+    });
+    prune(before.side);
   }
 
   void removed(OrderId ref, Qty shares, bool whole) {
@@ -249,16 +285,14 @@ class StrategySim : public itch::NullHandler {
     } else {
       book_.reduce(ref, shares);
     }
-    Shadow& q = quote(before.side);
-    if (q.state == Shadow::State::Live && before.price == q.price && before.seq < q.seq_limit) {
-      q.ahead -= std::min<std::uint64_t>(q.ahead, gone);
-    }
+    for_each_live(before.side, [&](Shadow& q) {
+      if (before.price == q.price && before.seq < q.seq_limit) q.ahead -= std::min<std::uint64_t>(q.ahead, gone);
+    });
   }
 
-  void fill(Side side, Qty shares) {
-    Shadow& q = quote(side);
+  Qty fill(Side side, Shadow& q, Qty shares) {
     const Qty qty = std::min(q.remaining, shares);
-    if (qty == 0) return;
+    if (qty == 0) return 0;
     if (!q.filled) {
       q.filled = true;
       ++stats_.quotes_filled;
@@ -270,9 +304,32 @@ class StrategySim : public itch::NullHandler {
     (side == Side::Buy ? stats_.shares_bought : stats_.shares_sold) += qty;
     stats_.max_abs_inventory = std::max(stats_.max_abs_inventory, std::abs(inventory_));
     ++stats_.fills;
+    const bool stale = q.dead_at.has_value();
+    if (stale) ++stats_.fills_while_cancelling;
     // last_mid_ is still the mid from before this message: the price we were hit at.
-    fills_.push_back({now_, side, q.price, qty, last_mid_.value_or(std::nan("")), std::nan("")});
-    if (q.remaining == 0) q.state = Shadow::State::Off;
+    fills_.push_back({now_, side, q.price, qty, stale, last_mid_.value_or(std::nan("")), std::nan("")});
+    return qty;
+  }
+
+  // Drops fully filled quotes and quotes whose cancel has arrived.
+  void prune(Side side) {
+    auto& qs = quotes_[index(side)];
+    qs.erase(std::remove_if(qs.begin(), qs.end(),
+                            [this](const Shadow& q) { return q.remaining == 0 || (q.dead_at && *q.dead_at <= now_); }),
+             qs.end());
+  }
+
+  // Applies the passage of time: in-flight orders arrive and join the back of
+  // their level; cancels arrive and remove their quotes.
+  void advance(Side side) {
+    for (Shadow& q : quotes_[index(side)]) {
+      if (!q.live && q.live_at <= now_) {
+        q.live = true;
+        q.ahead = book_.depth_at(side, q.price);
+        q.seq_limit = seq_limit_;
+      }
+    }
+    prune(side);
   }
 
   void refresh_mid() {
@@ -290,7 +347,7 @@ class StrategySim : public itch::NullHandler {
     while (next_markout_ < fills_.size() && fills_[next_markout_].timestamp + params_.markout_ns <= now_) {
       fills_[next_markout_++].mid_after = last_mid_.value_or(std::nan(""));
     }
-    if (market_open_ && last_mid_) {
+    if (last_mid_) {
       for (; next_sample_ <= now_; next_sample_ += params_.sample_ns) {
         samples_.push_back({next_sample_, *last_mid_, inventory_, pnl()});
       }
@@ -299,32 +356,33 @@ class StrategySim : public itch::NullHandler {
     Quotes want;
     const auto bid = book_.best_price(Side::Buy);
     const auto ask = book_.best_price(Side::Sell);
-    if (market_open_ && trading_ && bid && ask && *bid < *ask) want = policy_(*bid, *ask, inventory_);
+    if (trading_ && bid && ask && *bid < *ask) want = policy_(*bid, *ask, inventory_);
     place(Side::Buy, want.bid, want.size);
     place(Side::Sell, want.ask, want.size);
-    activate(Side::Buy);
-    activate(Side::Sell);
+    advance(Side::Buy);  // with zero latency, orders and cancels take effect immediately
+    advance(Side::Sell);
   }
 
+  // Moves a side toward one working quote at `price` (none if nullopt).
   void place(Side side, std::optional<Price> price, Qty size) {
-    Shadow& q = quote(side);
-    if (q.state != Shadow::State::Off && price && *price == q.price) return;  // keep our queue position
-    if (q.state != Shadow::State::Off) {
-      q.state = Shadow::State::Off;
+    auto& qs = quotes_[index(side)];
+    bool keep = false;
+    for (Shadow& q : qs) {
+      if (q.dead_at) continue;
+      if (price && q.price == *price && !keep) {
+        keep = true;  // already working at this price: keep our queue position
+        continue;
+      }
+      q.dead_at = now_ + params_.latency_ns;  // send a cancel
       ++stats_.quotes_cancelled;
     }
-    if (!price || size == 0) return;
-    q = Shadow{Shadow::State::Pending, *price, size, 0, 0, now_ + params_.entry_latency_ns, false};
+    if (keep || !price || size == 0) return;
+    Shadow q;
+    q.price = *price;
+    q.remaining = size;
+    q.live_at = now_ + params_.latency_ns;
+    qs.push_back(q);
     ++stats_.quotes_sent;
-  }
-
-  // A pending quote joins the back of its level once its entry latency has passed.
-  void activate(Side side) {
-    Shadow& q = quote(side);
-    if (q.state != Shadow::State::Pending || now_ < q.live_at) return;
-    q.state = Shadow::State::Live;
-    q.ahead = book_.depth_at(side, q.price);
-    q.seq_limit = seq_limit_;
   }
 
   std::string symbol_;
@@ -337,8 +395,7 @@ class StrategySim : public itch::NullHandler {
   std::uint64_t now_ = 0;
   Seq seq_limit_ = 0;
 
-  Shadow bid_;
-  Shadow ask_;
+  std::array<std::vector<Shadow>, 2> quotes_;  // [buy, sell]
   std::int64_t inventory_ = 0;
   std::int64_t cash_ = 0;  // price units * shares
   std::optional<double> last_mid_;
