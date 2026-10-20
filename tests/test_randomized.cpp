@@ -192,7 +192,9 @@ TEST(FlatIndex, MatchesStdUnorderedMap) {
         const std::uint32_t* got = index.find(key);
         auto it = want.find(key);
         ASSERT_EQ(got != nullptr, it != want.end()) << "op " << i;
-        if (got) ASSERT_EQ(*got, it->second) << "op " << i;
+        if (got) {
+          ASSERT_EQ(*got, it->second) << "op " << i;
+        }
       }
     }
     ASSERT_EQ(index.size(), want.size());
