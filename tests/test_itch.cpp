@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 #include <zlib.h>
 
+#include <unistd.h>
+
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -153,8 +155,10 @@ TEST(ItchParser, HandlerCanStopEarly) {
 class GzFileTest : public ::testing::Test {
  protected:
   void SetUp() override {
+    // Unique per test and per process: ctest runs these tests in parallel.
+    const std::string test = ::testing::UnitTest::GetInstance()->current_test_info()->name();
     path_ = (std::filesystem::temp_directory_path() /
-             ("lob_itch_test_" + std::to_string(::testing::UnitTest::GetInstance()->random_seed()) + ".gz"))
+             ("lob_itch_" + test + "_" + std::to_string(::getpid()) + ".gz"))
                 .string();
     for (std::uint64_t i = 0; i < 1000; ++i) {
       enc_.add_order(3, kTs + i, i + 1, i % 2 ? Side::Buy : Side::Sell, 100, "MSFT", 4'000'000);
